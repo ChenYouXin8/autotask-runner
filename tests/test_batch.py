@@ -252,11 +252,11 @@ tasks:
 tasks:
   - prompt: "Task in project A"
     session: "task-a"
-    working_dir: "{project_a}"
+    working_dir: '{project_a}'
 
   - prompt: "Task in project B"
     session: "task-b"
-    working_dir: "{project_b}"
+    working_dir: '{project_b}'
 """
         yaml_file.write_text(yaml_content)
 

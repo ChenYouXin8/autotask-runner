@@ -1,0 +1,66 @@
+# task_book_demo.yaml — 双引擎无人值守队列示例任务书
+#
+# 引擎：agy（Antigravity，主力，attempt 1）→ codex（OpenAI Codex，兜底，attempt >= 2）
+#
+# 快速上手：
+#   1) 批量入队：  python claude-queue.py batch task_book_demo.yaml
+#   2) 无人值守：  python claude-queue.py worker --idle 30
+#   3) 查看进度：  python claude-queue.py list
+#
+# 字段说明：
+#   session         任务会话名，供 depends_on 引用（唯一标识）
+#   working_dir     任务执行的“目标工作区”，"." 表示 worker 当前目录
+#   depends_on      前置任务的 session 列表，前置未 COMPLETED 则本任务不调度
+#   verify_commands 外部硬核验收命令列表；全部返回码为 0 才判定任务 COMPLETED
+#   max_attempts    最大尝试次数（第 2 次起自动切换到 codex）
+#   on_fail         fail（默认，仅标记失败）| skip（回滚代码 + 写 STUCK.md + 标记 SKIPPED）
+#   priority        数值越大越优先
+#
+# 注意：示例用 working_dir: "."（即 worker 当前目录）便于本地试跑；
+#       生产使用时请改为你的真实项目路径，避免污染当前目录。
+
+tasks:
+  # ---------------------------------------------------------------- 任务 1
+  # 前置任务：创建一个最小工件，用于验证「验收命令 + 自动提交」闭环
+  - prompt: |
+      在当前工作目录下创建子目录 demo_output，
+      并在其中新建文件 hello.txt，内容为单独一行：hello
+      完成后用一句话说明你做了什么，不要创建其它文件。
+    session: "demo-create-hello"
+    priority: 10
+    max_attempts: 3
+    on_fail: skip
+    working_dir: "."
+    depends_on: []
+    verify_commands:
+      - >-
+        python -c "import pathlib,sys;p=pathlib.Path('demo_output/hello.txt');sys.exit(0 if p.exists() and p.read_text(encoding='utf-8').strip()=='hello' else 1)"
+
+  # ---------------------------------------------------------------- 任务 2
+  # 依赖任务 1；只有任务 1 验收通过（COMPLETED）后才会被调度
+  - prompt: |
+      把 demo_output/hello.txt 的内容改成单独一行：hello world
+      不要新建任何其它文件，也不要改动 demo_output 之外的任何东西。
+    session: "demo-update-world"
+    priority: 5
+    max_attempts: 3
+    on_fail: skip
+    working_dir: "."
+    depends_on:
+      - "demo-create-hello"
+    verify_commands:
+      # 验收 1：文件内容必须精确等于 hello world
+      - >-
+        python -c "import pathlib,sys;p=pathlib.Path('demo_output/hello.txt');sys.exit(0 if p.exists() and p.read_text(encoding='utf-8').strip()=='hello world' else 1)"
+      # 验收 2：demo_output 下应且仅应有 1 个文件（防止 AI 乱建文件）
+      - >-
+        python -c "import pathlib,sys;sys.exit(0 if len(list(pathlib.Path('demo_output').glob('*')))==1 else 1)"
+
+# 预期执行顺序与结果：
+#   1. demo-create-hello  —— attempt 1 由 agy 执行；验收通过 → git 自动提交 → COMPLETED
+#   2. demo-update-world  —— 依赖 satisfied 后执行；验收通过 → git 自动提交 → COMPLETED
+#
+# 若任一任务验收失败：
+#   attempt 1 失败 → 自动改用 codex 重试，并把验收报错拼接到下一轮 prompt 末尾
+#   attempt 用尽 → 若 on_fail: skip 则 git reset --hard + git clean -fd 回滚脏代码，
+#                  错误日志追加进 STUCK.md，任务标记 SKIPPED，队列继续执行其它任务

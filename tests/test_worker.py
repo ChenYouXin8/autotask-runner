@@ -37,7 +37,6 @@ class TestWorkerInitialization:
         assert worker.base_retry_delay == 60
         assert worker.running is True
         assert worker.save_output is False
-        assert worker.usage_checker is None
 
     def test_init_with_output_saving(self, temp_queue, temp_output_dir):
         """Test worker initialization with output saving enabled"""
@@ -418,17 +417,17 @@ class TestCmdOutput:
 class TestWorkerRun:
     """Test worker.run() main event loop"""
 
-    def test_run_exits_on_empty_queue(self, temp_queue):
+    def test_run_exits_on_empty_queue(self, temp_queue, tmp_path):
         """Worker exits cleanly when queue is empty"""
-        worker = ClaudeWorker(temp_queue)
+        worker = ClaudeWorker(temp_queue, report_file=tmp_path / "MORNING_REPORT.md")
         worker.run()  # Should return without error
 
-    def test_run_resets_interrupted_running_tasks(self, temp_queue):
+    def test_run_resets_interrupted_running_tasks(self, temp_queue, tmp_path):
         """On startup, tasks stuck in RUNNING are reset to QUEUED"""
         task = temp_queue.add_task("Test task")
         temp_queue.update_task(task.id, status=TaskStatus.RUNNING.value)
 
-        worker = ClaudeWorker(temp_queue)
+        worker = ClaudeWorker(temp_queue, report_file=tmp_path / "MORNING_REPORT.md")
         mock_result = Mock()
         mock_result.returncode = 0
         mock_result.stdout = ""
@@ -440,7 +439,7 @@ class TestWorkerRun:
         updated = temp_queue.get_all_tasks()[0]
         assert updated.status == TaskStatus.COMPLETED.value  # Was reset to QUEUED, then executed
 
-    def test_run_exponential_backoff_on_failure(self, temp_queue):
+    def test_run_exponential_backoff_on_failure(self, temp_queue, tmp_path):
         """Failed tasks trigger exponential backoff delay"""
         temp_queue.add_task("Test task", max_attempts=2)
 
@@ -450,7 +449,9 @@ class TestWorkerRun:
         mock_result.stderr = "Some error"
 
         sleep_calls = []
-        worker = ClaudeWorker(temp_queue, base_retry_delay=60)
+        worker = ClaudeWorker(
+            temp_queue, base_retry_delay=60, report_file=tmp_path / "MORNING_REPORT.md"
+        )
         with patch("subprocess.run", return_value=mock_result):
             with patch("time.sleep", side_effect=lambda s: sleep_calls.append(s)):
                 worker.run()
@@ -458,7 +459,7 @@ class TestWorkerRun:
         # Should have slept with exponential backoff (60 * 2^0 = 60 for first failure)
         assert any(s == 60 for s in sleep_calls)
 
-    def test_run_rate_limited_task_waits_retry_after(self, temp_queue):
+    def test_run_rate_limited_task_waits_retry_after(self, temp_queue, tmp_path):
         """Rate-limited task waits the retry-after duration before continuing"""
         temp_queue.add_task("Test task", max_attempts=2)
 
@@ -475,7 +476,7 @@ class TestWorkerRun:
         success_result.stderr = ""
 
         sleep_calls = []
-        worker = ClaudeWorker(temp_queue)
+        worker = ClaudeWorker(temp_queue, report_file=tmp_path / "MORNING_REPORT.md")
         with patch("subprocess.run", side_effect=[rate_limit_result, success_result]):
             with patch("time.sleep", side_effect=lambda s: sleep_calls.append(s)):
                 worker.run()
@@ -483,88 +484,3 @@ class TestWorkerRun:
         assert 120 in sleep_calls
         updated = temp_queue.get_all_tasks()[0]
         assert updated.status == TaskStatus.COMPLETED.value
-
-
-class TestCheckAndWaitForLimits:
-    """Test check_and_wait_for_limits sleep behavior"""
-
-    def _make_checker(
-        self, utilization_5h=50.0, utilization_7d=50.0, resets_at="2099-01-01T12:00:00.000000Z"
-    ):
-        """Build a mocked ClaudeUsageChecker"""
-        checker = Mock()
-        parsed = {
-            "five_hour": {
-                "utilization": utilization_5h,
-                "utilization_percent": f"{utilization_5h:.1f}%",
-                "resets_at": resets_at,
-                "resets_at_local": "2099-01-01 12:00:00 UTC",
-                "time_until_reset": "1h 0m",
-            },
-            "seven_day": {
-                "utilization": utilization_7d,
-                "utilization_percent": f"{utilization_7d:.1f}%",
-                "resets_at": resets_at,
-                "resets_at_local": "2099-01-01 12:00:00 UTC",
-                "time_until_reset": "1h 0m",
-            },
-        }
-        checker.is_limit_exceeded.return_value = (False, None, None)
-        return checker, parsed
-
-    def test_no_sleep_when_limit_ok(self, temp_queue):
-        """Worker does not sleep when usage is below threshold"""
-        checker, _ = self._make_checker(utilization_5h=50.0)
-        worker = ClaudeWorker(temp_queue, usage_checker=checker)
-
-        with patch("time.sleep") as mock_sleep:
-            worker.check_and_wait_for_limits()
-
-        mock_sleep.assert_not_called()
-
-    def test_sleeps_until_reset_when_limit_exceeded(self, temp_queue):
-        """Worker sleeps until reset time when limit is exceeded"""
-        from datetime import datetime, timedelta, timezone
-
-        future_reset = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime(
-            "%Y-%m-%dT%H:%M:%S.000000Z"
-        )
-        checker, parsed = self._make_checker(utilization_5h=96.0, resets_at=future_reset)
-        checker.is_limit_exceeded.return_value = (True, "5-hour limit at 96.0%", parsed)
-
-        worker = ClaudeWorker(temp_queue, usage_checker=checker)
-        sleep_calls = []
-        with patch("time.sleep", side_effect=lambda s: sleep_calls.append(s)):
-            worker.check_and_wait_for_limits()
-
-        assert len(sleep_calls) == 1
-        # Should sleep roughly 3600 seconds (+10 buffer), within a reasonable range
-        assert 3500 < sleep_calls[0] < 3700
-
-    def test_fallback_sleep_when_no_reset_time(self, temp_queue):
-        """Worker sleeps 300s fallback when reset time is unavailable"""
-        checker, parsed = self._make_checker(utilization_5h=96.0)
-        parsed["five_hour"]["resets_at"] = None
-        # First call: limit exceeded; second call: limits OK so loop exits
-        checker.is_limit_exceeded.side_effect = [
-            (True, "5-hour limit at 96.0%", parsed),
-            (False, None, None),
-        ]
-
-        worker = ClaudeWorker(temp_queue, usage_checker=checker)
-        sleep_calls = []
-        with patch("time.sleep", side_effect=lambda s: sleep_calls.append(s)):
-            worker.check_and_wait_for_limits()
-
-        assert 300 in sleep_calls
-
-    def test_returns_without_blocking_on_fetch_error(self, temp_queue):
-        """Worker does not block if limit check raises an exception"""
-        checker = Mock()
-        checker.is_limit_exceeded.side_effect = Exception("Network error")
-
-        worker = ClaudeWorker(temp_queue, usage_checker=checker)
-        with patch("time.sleep") as mock_sleep:
-            worker.check_and_wait_for_limits()  # Should return, not raise
-
-        mock_sleep.assert_not_called()

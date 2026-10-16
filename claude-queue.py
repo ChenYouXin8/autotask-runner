@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-Claude Code Task Queue Manager
-Handles batch execution of Claude tasks with automatic retry on rate limits.
+Task Queue Manager — dual-engine fork (Antigravity `agy` + OpenAI `codex`)
+
+Handles batch execution of AI coding tasks with:
+  * two interchangeable CLI engines with automatic failover
+    (attempt 1 -> `agy`, retries -> `codex`),
+  * an external hard verifier (`verify_commands`) that must exit 0,
+  * a git guard that auto-commits verified work and rolls back skipped tasks.
 
 Usage:
     # Add tasks
     ./claude-queue.py add "Refactor authentication module" --session auth-refactor
-    ./claude-queue.py add "Write tests for API endpoints" --session api-tests
-    ./claude-queue.py add "Update documentation" --session docs-update
+    ./claude-queue.py add "Fix the failing tests" --verify-command "pytest" --on-fail skip
 
-    # Start worker (requires CLAUDE_SESSION_KEY env var for usage limit checking)
-    export CLAUDE_SESSION_KEY="your-session-key"
+    # Batch load a task book
+    ./claude-queue.py batch task_book_demo.yaml
+
+    # Start worker
     ./claude-queue.py worker
 
-    # Check Claude usage limits
-    ./claude-queue.py usage
-
-    # Check status
+    # Check status / list all tasks
     ./claude-queue.py status
-
-    # List all tasks
     ./claude-queue.py list
 """
 
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import logging
 import os
@@ -42,8 +42,23 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
-import requests
+# Cross-platform advisory file locking.
+# fcntl only exists on POSIX; Windows falls back to a best-effort msvcrt lock.
+try:
+    import fcntl as _fcntl
+
+    fcntl: Any = _fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+try:
+    import msvcrt as _msvcrt
+
+    msvcrt: Any = _msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 # Optional YAML support for batch loading
 try:
@@ -82,19 +97,127 @@ class QueueFileError(QueueError):
     pass
 
 
-class SessionExpiredError(QueueError):
-    """Raised when the Claude session key is expired or invalid"""
+def _acquire_lock(file_obj, exclusive: bool) -> None:
+    """Acquire an advisory lock (no-op when the platform cannot provide one)."""
+    if fcntl is not None:
+        fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    elif msvcrt is not None:
+        try:
+            file_obj.seek(0)
+            msvcrt.locking(file_obj.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError:  # pragma: no cover - locking is best effort on Windows
+            logger.debug("msvcrt locking unavailable; continuing without a lock")
+
+
+def _release_lock(file_obj) -> None:
+    """Release an advisory lock previously taken with :func:`_acquire_lock`."""
+    if fcntl is not None:
+        fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        try:
+            file_obj.seek(0)
+            msvcrt.locking(file_obj.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:  # pragma: no cover
+            pass
+
+
+# ---------------------------------------------------------------------------
+# CLI engine abstraction
+#
+# The original project hard-coded the `claude` CLI. This fork decouples the
+# executor into interchangeable engines with automatic failover:
+#   "agy"    -> Antigravity CLI    (attempt 1 when installed)
+#   "gemini" -> Google Gemini CLI  (attempt 1 when installed)
+#   "codex"  -> OpenAI Codex CLI   (retry / default everywhere)
+#
+# Defaults are both "codex": `agy` and `gemini` are not registered on PATH on
+# every machine, and silently burning attempt 1 on a missing binary would waste
+# a retry. Opt in with --primary-engine agy (or gemini) when available.
+# ---------------------------------------------------------------------------
+
+
+class EngineError(QueueError):
+    """Raised when an unknown engine is requested or cannot be resolved."""
 
     pass
 
 
-_SESSION_EXPIRED_MSG = (
-    "Session key expired or invalid.\n"
-    "  1. Go to https://claude.ai in your browser\n"
-    "  2. Open DevTools > Application > Cookies > https://claude.ai\n"
-    "  3. Copy the value of 'sessionKey'\n"
-    "  4. Set CLAUDE_SESSION_KEY=<value>"
-)
+DEFAULT_PRIMARY_ENGINE = "codex"
+DEFAULT_FALLBACK_ENGINE = "codex"
+
+# Bare binary name resolved through shutil.which (honours PATHEXT on Windows).
+ENGINE_BINARIES: dict[str, str] = {
+    "agy": "agy",
+    "gemini": "gemini",
+    "codex": "codex",
+}
+
+# Optional env var to override the resolved executable (useful on Windows).
+ENGINE_BIN_ENV: dict[str, str] = {
+    "agy": "AGY_BIN",
+    "gemini": "GEMINI_BIN",
+    "codex": "CODEX_BIN",
+}
+
+
+def build_engine_command(engine: str, prompt: str, binary: str) -> list[str]:
+    """Build the argv for a given engine.
+
+    - agy:    [agy, -p, {prompt}, --dangerously-skip-permissions]
+    - gemini: [gemini, -p, {prompt}, --yolo]
+    - codex:  [codex, exec, --ask-for-approval, never, --sandbox,
+               workspace-write, {prompt}]
+    """
+    if engine == "agy":
+        return [binary, "-p", prompt, "--dangerously-skip-permissions"]
+    if engine == "gemini":
+        # `--yolo` = non-interactive auto-approve, the Gemini CLI equivalent of
+        # agy's --dangerously-skip-permissions.
+        return [binary, "-p", prompt, "--yolo"]
+    if engine == "codex":
+        return [
+            binary,
+            "exec",
+            "--ask-for-approval",
+            "never",
+            "--sandbox",
+            "workspace-write",
+            prompt,
+        ]
+    raise EngineError(f"Unknown engine: {engine}")
+
+
+def resolve_engine_binary(engine: str) -> str | None:
+    """Resolve an engine executable in a Windows-compatible way.
+
+    Precedence:
+      1. Explicit override via env var (AGY_BIN / CODEX_BIN), used as-is when
+         the path exists, otherwise passed through shutil.which.
+      2. shutil.which() lookup, which honours PATHEXT (.exe/.cmd/.bat) on Windows.
+
+    Returns None when the binary cannot be found.
+    """
+    env_name = ENGINE_BIN_ENV.get(engine)
+    override = (os.getenv(env_name, "") if env_name else "").strip()
+    if override:
+        override_path = Path(override).expanduser()
+        if override_path.exists():
+            return str(override_path)
+        resolved = shutil.which(override)
+        if resolved:
+            return resolved
+        logger.warning(f"{env_name}='{override}' could not be resolved")
+
+    return shutil.which(ENGINE_BINARIES.get(engine, engine))
+
+
+def select_engine(attempt: int, primary: str, fallback: str) -> str:
+    """Return the engine to use for a 1-based attempt number.
+
+    Attempt 1 uses the primary engine (agy); attempt 2+ switches to the
+    fallback engine (codex), giving a retry a genuinely different executor.
+    """
+    return primary if attempt <= 1 else fallback
 
 
 class TaskStatus(Enum):
@@ -103,286 +226,7 @@ class TaskStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     RATE_LIMITED = "rate_limited"
-
-
-class ClaudeUsageChecker:
-    """Checks Claude usage limits via the claude.ai API"""
-
-    def __init__(
-        self, session_key: str | None = None, api_url: str | None = None, org_id: str | None = None
-    ):
-        """
-        Initialize the usage checker.
-
-        Args:
-            session_key: Claude session cookie. If not provided, reads from CLAUDE_SESSION_KEY env var.
-            api_url: Override full API URL if needed
-            org_id: Organization ID. If not provided, will be auto-detected from CLAUDE_ORG_ID env var or API.
-        """
-        self.session_key = session_key or os.getenv("CLAUDE_SESSION_KEY")
-
-        if not self.session_key:
-            raise ValueError(
-                "Session key not provided. Set CLAUDE_SESSION_KEY environment variable.\n"
-                "Get your session key from browser:\n"
-                "1. Go to https://claude.ai/settings/usage\n"
-                "2. Open DevTools > Application > Cookies\n"
-                "3. Copy the 'sessionKey' cookie value"
-            )
-
-        self.session = requests.Session()
-        self.session.cookies.set("sessionKey", self.session_key)
-
-        # Add common headers to look like a browser
-        self.session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                "Accept": "application/json",
-                "Referer": "https://claude.ai/",
-            }
-        )
-
-        # Determine the API URL
-        if api_url:
-            self.usage_api_url = api_url
-        else:
-            # Get org ID from parameter, env var, or auto-detect
-            self.org_id = org_id or os.getenv("CLAUDE_ORG_ID")
-            if not self.org_id:
-                logger.info("Auto-detecting organization ID...")
-                self.org_id = self._get_organization_id()
-
-            self.usage_api_url = f"https://claude.ai/api/organizations/{self.org_id}/usage"
-            logger.debug(f"Using API URL: {self.usage_api_url}")
-
-    def _get_organization_id(self) -> str:
-        """
-        Auto-detect organization ID from the Claude API.
-
-        Returns:
-            str: Organization ID
-
-        Raises:
-            ValueError: If organization ID cannot be determined
-        """
-        try:
-            # Try to get account info which should contain organization details
-            response = self.session.get("https://claude.ai/api/organizations", timeout=10)
-            try:
-                response.raise_for_status()
-            except requests.exceptions.HTTPError as e:
-                if e.response is not None and e.response.status_code == 401:
-                    raise SessionExpiredError(_SESSION_EXPIRED_MSG) from e
-                raise
-
-            orgs = response.json()
-
-            # Get the first/default organization
-            if isinstance(orgs, list) and len(orgs) > 0:
-                org_id = orgs[0].get("uuid") or orgs[0].get("id")
-                if org_id:
-                    logger.info(f"Detected organization ID: {org_id}")
-                    return org_id
-
-            raise ValueError("No organizations found in API response")
-
-        except requests.RequestException as e:
-            raise ValueError(
-                f"Failed to auto-detect organization ID: {e}\n"
-                "Please set CLAUDE_ORG_ID environment variable or pass org_id parameter.\n"
-                "Find your org ID from the Network tab at https://claude.ai/settings/usage"
-            ) from e
-
-    def fetch_usage(self) -> dict:
-        """
-        Fetch current usage data from Claude API.
-
-        Returns:
-            dict: Usage data with five_hour and seven_day limits
-
-        Raises:
-            requests.RequestException: If API request fails
-        """
-        try:
-            response = self.session.get(self.usage_api_url, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            self._validate_usage_response(data)
-            return data
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 401:
-                raise SessionExpiredError(_SESSION_EXPIRED_MSG) from e
-            raise
-
-    @staticmethod
-    def _validate_usage_response(data: dict) -> None:
-        if not isinstance(data, dict):
-            raise ValueError(
-                "Usage API response has unexpected format (expected a dict). "
-                "The claude.ai API may have changed — please file an issue."
-            )
-        expected = {"five_hour", "seven_day"}
-        if not expected.intersection(data.keys()):
-            raise ValueError(
-                f"Usage API response missing expected keys {expected} "
-                f"(got: {list(data.keys())[:10]}). "
-                "The claude.ai API may have changed — please file an issue."
-            )
-        for section in ("five_hour", "seven_day"):
-            if section in data and data[section] is not None:
-                sub = data[section]
-                if not isinstance(sub, dict) or "utilization" not in sub:
-                    raise ValueError(
-                        f"Usage API response has unexpected format in '{section}'. "
-                        "The claude.ai API may have changed — please file an issue."
-                    )
-
-    def parse_usage(self, data: dict) -> dict:
-        """
-        Parse usage data into a more readable format.
-
-        Args:
-            data: Raw usage data from API
-
-        Returns:
-            dict: Parsed usage information
-        """
-        result = {}
-
-        # Parse 5-hour limit
-        if "five_hour" in data and data["five_hour"]:
-            five_hour = data["five_hour"]
-            result["five_hour"] = {
-                "utilization": five_hour.get("utilization", 0),
-                "utilization_percent": f"{five_hour.get('utilization', 0):.1f}%",
-                "resets_at": five_hour.get("resets_at"),
-                "resets_at_local": self._parse_timestamp(five_hour.get("resets_at")),
-                "time_until_reset": self._time_until(five_hour.get("resets_at")),
-            }
-
-        # Parse 7-day limit
-        if "seven_day" in data and data["seven_day"]:
-            seven_day = data["seven_day"]
-            result["seven_day"] = {
-                "utilization": seven_day.get("utilization", 0),
-                "utilization_percent": f"{seven_day.get('utilization', 0):.1f}%",
-                "resets_at": seven_day.get("resets_at"),
-                "resets_at_local": self._parse_timestamp(seven_day.get("resets_at")),
-                "time_until_reset": self._time_until(seven_day.get("resets_at")),
-            }
-
-        # Include raw data for reference
-        result["raw"] = data
-
-        return result
-
-    @staticmethod
-    def _parse_timestamp(ts_str: str | None) -> str | None:
-        """Convert ISO timestamp to local time string"""
-        if not ts_str:
-            return None
-        try:
-            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        except Exception:
-            return ts_str
-
-    @staticmethod
-    def _time_until(ts_str: str | None) -> str | None:
-        """Calculate time remaining until timestamp"""
-        if not ts_str:
-            return None
-        try:
-            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            now = datetime.now(dt.tzinfo)
-            delta = dt - now
-
-            if delta.total_seconds() < 0:
-                return "Already reset"
-
-            hours = int(delta.total_seconds() // 3600)
-            minutes = int((delta.total_seconds() % 3600) // 60)
-
-            if hours > 0:
-                return f"{hours}h {minutes}m"
-            else:
-                return f"{minutes}m"
-        except Exception:
-            return None
-
-    def check_usage(self, json_output: bool = False) -> dict:
-        """
-        Check usage and print/return results.
-
-        Args:
-            json_output: If True, output as JSON
-
-        Returns:
-            dict: Parsed usage data
-        """
-        usage_data = self.fetch_usage()
-        parsed = self.parse_usage(usage_data)
-
-        if json_output:
-            print(json.dumps(parsed, indent=2))
-        else:
-            self._print_usage(parsed)
-
-        return parsed
-
-    @staticmethod
-    def _print_limit_section(name: str, data: dict) -> None:
-        """Pretty print a single usage limit section"""
-        u = data["utilization"]
-        status = "🔴 CRITICAL" if u >= 90 else ("🟡 HIGH" if u >= 70 else "🟢 OK")
-        print(f"\n{name}: {status}")
-        print(f"   Utilization: {data['utilization_percent']}")
-        print(f"   Resets in:   {data['time_until_reset']}")
-        print(f"   Reset time:  {data['resets_at_local']}")
-
-    @staticmethod
-    def _print_usage(parsed: dict):
-        """Pretty print usage information"""
-        print("\n" + "=" * 60)
-        print("Claude Usage Limits")
-        print("=" * 60)
-        if "five_hour" in parsed:
-            ClaudeUsageChecker._print_limit_section("5-Hour Session Limit", parsed["five_hour"])
-        if "seven_day" in parsed:
-            ClaudeUsageChecker._print_limit_section("7-Day Weekly Limit", parsed["seven_day"])
-        print("\n" + "=" * 60 + "\n")
-
-    def is_limit_exceeded(self, threshold: float = 95.0) -> tuple[bool, str | None, dict | None]:
-        """
-        Check if usage limit is exceeded.
-
-        Args:
-            threshold: Utilization threshold percentage (0-100)
-
-        Returns:
-            tuple: (is_exceeded, reason, parsed_data)
-        """
-        try:
-            usage_data = self.fetch_usage()
-            parsed = self.parse_usage(usage_data)
-
-            # Check 5-hour limit
-            if "five_hour" in parsed:
-                util = parsed["five_hour"]["utilization"]
-                if util >= threshold:
-                    return True, f"5-hour limit at {util:.1f}%", parsed
-
-            # Check 7-day limit
-            if "seven_day" in parsed:
-                util = parsed["seven_day"]["utilization"]
-                if util >= threshold:
-                    return True, f"7-day limit at {util:.1f}%", parsed
-
-            return False, None, None
-
-        except Exception as e:
-            logger.warning(f"Failed to check usage limits: {e}")
-            return False, None, None
+    SKIPPED = "skipped"
 
 
 @dataclass
@@ -401,6 +245,11 @@ class Task:
     depends_on: list[str] | None = None  # List of task IDs this task depends on
     working_dir: str | None = None  # Directory where task should execute
     timeout: int | None = None  # Per-task timeout in seconds; None = use worker default
+    verify_commands: list[str] | None = None  # Commands that must ALL exit 0 to pass
+    on_fail: str = "fail"  # "fail" (default) or "skip" (rollback + STUCK.md)
+    feedback: str = ""  # Verifier feedback appended to the prompt on retry
+    engine: str | None = None  # Engine used for the most recent attempt
+    commit_hash: str | None = None  # Git commit created when the task verified OK
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -469,6 +318,25 @@ class TaskQueue:
                 raise ValidationError(f"Working directory does not exist: {working_dir}")
             if not working_path.is_dir():
                 raise ValidationError(f"Working directory is not a directory: {working_dir}")
+
+    @staticmethod
+    def _validate_verify_commands(verify_commands: list[str] | None) -> None:
+        """Validate the optional external verifier command list"""
+        if verify_commands is None:
+            return
+        if isinstance(verify_commands, str):
+            raise ValidationError("verify_commands must be a list of command strings")
+        if not isinstance(verify_commands, list):
+            raise ValidationError("verify_commands must be a list of command strings")
+        for command in verify_commands:
+            if not isinstance(command, str) or not command.strip():
+                raise ValidationError("Each verify command must be a non-empty string")
+
+    @staticmethod
+    def _validate_on_fail(on_fail: str) -> None:
+        """Validate the on_fail policy"""
+        if on_fail not in ("fail", "skip"):
+            raise ValidationError("on_fail must be either 'fail' or 'skip'")
 
     def _validate_dependencies(
         self,
@@ -561,14 +429,14 @@ class TaskQueue:
         try:
             with open(self.queue_file) as f:
                 # Acquire shared lock for reading
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                _acquire_lock(f, exclusive=False)
                 try:
                     data = json.load(f)
                     if not isinstance(data, list):
                         raise QueueFileError("Invalid queue format: expected list")
                     return [Task.from_dict(t) for t in data]
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    _release_lock(f)
         except FileNotFoundError:
             logger.warning(f"Queue file not found: {self.queue_file}, creating new queue")
             self._ensure_queue_exists()
@@ -598,13 +466,13 @@ class TaskQueue:
             ) as f:
                 temp_file = Path(f.name)
                 # Acquire exclusive lock for writing
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                _acquire_lock(f, exclusive=True)
                 try:
                     json.dump([t.to_dict() for t in tasks], f, indent=2)
                     f.flush()
                     os.fsync(f.fileno())  # Ensure written to disk
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    _release_lock(f)
 
             # Atomic rename
             temp_file.replace(self.queue_file)
@@ -624,6 +492,8 @@ class TaskQueue:
         depends_on: list[str] | None = None,
         working_dir: str | None = None,
         timeout: int | None = None,
+        verify_commands: list[str] | None = None,
+        on_fail: str = "fail",
     ) -> Task:
         # Validate inputs
         self._validate_prompt(prompt)
@@ -631,6 +501,8 @@ class TaskQueue:
         self._validate_priority(priority)
         self._validate_max_attempts(max_attempts)
         self._validate_working_dir(working_dir)
+        self._validate_verify_commands(verify_commands)
+        self._validate_on_fail(on_fail)
 
         tasks = self._load_tasks()
 
@@ -651,6 +523,8 @@ class TaskQueue:
             depends_on=depends_on,
             working_dir=working_dir,
             timeout=timeout,
+            verify_commands=verify_commands or None,
+            on_fail=on_fail,
         )
 
         tasks.append(task)
@@ -717,35 +591,48 @@ class TaskQueue:
             "completed": counts[TaskStatus.COMPLETED.value],
             "failed": counts[TaskStatus.FAILED.value],
             "rate_limited": counts[TaskStatus.RATE_LIMITED.value],
+            "skipped": counts[TaskStatus.SKIPPED.value],
         }
 
 
 class ClaudeWorker:
-    """Executes tasks from queue with retry logic"""
+    """Executes tasks from queue with retry logic and a two-engine executor.
+
+    Retained the original class name for backwards compatibility with the
+    project's test-suite; the implementation no longer shells out to `claude`.
+    """
 
     def __init__(
         self,
         queue: TaskQueue,
         base_retry_delay: int = 60,
-        usage_checker: ClaudeUsageChecker | None = None,
         save_output: bool = False,
         output_dir: Path | None = None,
         stream_output: bool = False,
-        usage_threshold: float = 95.0,
         idle: bool = False,
         idle_interval: int = 30,
         task_timeout: int = 3600,
+        primary_engine: str = DEFAULT_PRIMARY_ENGINE,
+        fallback_engine: str = DEFAULT_FALLBACK_ENGINE,
+        verify_timeout: int = 600,
+        enable_git_guard: bool = True,
+        report_file: Path | None = None,
     ):
         self.queue = queue
         self.base_retry_delay = base_retry_delay
-        self.usage_checker = usage_checker
         self.running = True
         self.save_output = save_output
         self.stream_output = stream_output
-        self.usage_threshold = usage_threshold
         self.idle = idle
         self.idle_interval = idle_interval
         self.task_timeout = task_timeout
+        self.primary_engine = primary_engine
+        self.fallback_engine = fallback_engine
+        self.verify_timeout = verify_timeout
+        self.enable_git_guard = enable_git_guard
+        # Morning report: written to the queue run directory by default.
+        self.report_file = report_file or (Path.cwd() / "MORNING_REPORT.md")
+        self.started_at: datetime | None = None
         self.output_dir = output_dir or (Path.home() / ".claude-queue" / "outputs")
 
         if self.save_output:
@@ -753,7 +640,7 @@ class ClaudeWorker:
 
     def parse_rate_limit_info(self, stderr: str) -> dict[str, int | str | None]:
         """
-        Parse rate limit information from Claude CLI error output.
+        Parse rate limit information from engine CLI error output.
 
         Returns dict with:
         - retry_after: seconds to wait (int or None)
@@ -796,90 +683,293 @@ class ClaudeWorker:
         logger.error("Could not extract retry-after from rate limit error")
         return None
 
-    def check_and_wait_for_limits(self) -> None:
-        """Check usage limits and wait if exceeded"""
-        if not self.usage_checker:
-            return
+    # --- Morning report ---------------------------------------------------
 
-        while True:
+    def write_morning_report(self, reason: str = "queue drained") -> None:
+        """Write MORNING_REPORT.md summarising this worker run.
+
+        Generated when the worker exits (queue drained or terminated) so the
+        run can be reviewed at a glance: elapsed time, every task's final
+        status/attempts/engine, the git commit hash on success or the failure
+        summary otherwise.
+        """
+        tasks = self.queue.get_all_tasks()
+        finished = datetime.now()
+        started = self.started_at or finished
+        elapsed = finished - started
+        total_seconds = int(elapsed.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        counts = Counter(t.status for t in tasks)
+        lines = [
+            "# MORNING REPORT",
+            "",
+            f"- 生成时间: {finished.isoformat(timespec='seconds')}",
+            f"- 开始时间: {started.isoformat(timespec='seconds')}",
+            f"- 总耗时: {hours}h {minutes}m {seconds}s（{total_seconds}s）",
+            f"- 退出原因: {reason}",
+            f"- 引擎配置: primary={self.primary_engine}, fallback={self.fallback_engine}",
+            f"- 任务统计: 共 {len(tasks)} 个"
+            f"（completed={counts['completed']}, skipped={counts['skipped']}, "
+            f"failed={counts['failed']}, rate_limited={counts['rate_limited']}, "
+            f"queued={counts['queued']}, running={counts['running']}）",
+            "",
+            "| 任务 ID | 任务名称 | 最终状态 | 尝试次数 | 引擎 | Git Commit / 失败摘要 |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+
+        for task in tasks:
+            if task.status == TaskStatus.COMPLETED.value and task.commit_hash:
+                detail = f"`{task.commit_hash}`"
+            elif task.status in (TaskStatus.SKIPPED.value, TaskStatus.FAILED.value):
+                summary = (task.last_error or "").strip().replace("\n", " ").replace("|", "\\|")
+                detail = f"{summary[:200]}" if summary else "—"
+            else:
+                detail = "—"
+
+            name = (task.session_name or task.id).replace("|", "\\|")
+            lines.append(
+                f"| `{task.id}` | {name} | {task.status} | "
+                f"{task.attempts}/{task.max_attempts} | {task.engine or '—'} | {detail} |"
+            )
+
+        lines.extend(
+            [
+                "",
+                "---",
+                "",
+                "> 由 claude-queue worker 自动生成。"
+                "状态 `skipped` 表示重试耗尽并已回滚，详情见工作区 `STUCK.md`。",
+                "",
+            ]
+        )
+
+        try:
+            self.report_file.parent.mkdir(parents=True, exist_ok=True)
+            self.report_file.write_text("\n".join(lines), encoding="utf-8")
+            print(f"\n📋 Morning report written to: {self.report_file}")
+        except Exception as e:
+            logger.warning(f"Failed to write morning report: {e}")
+
+    def _effective_prompt(self, task: Task) -> str:
+        """Base prompt, plus verifier feedback accumulated from prior attempts."""
+        if task.feedback and task.feedback.strip():
+            return f"{task.prompt}\n\n{task.feedback}"
+        return task.prompt
+
+    def run_verify_commands(self, task: Task, cwd: Path | None) -> tuple[bool, str]:
+        """Run the external hard verifier (`verify_commands`) in order.
+
+        The task only counts as verified when *every* command exits 0. On the
+        first failure the combined stdout/stderr tail (max 2000 chars) is
+        returned so the worker can feed it back into the next attempt's prompt.
+        """
+        commands = task.verify_commands or []
+        if not commands:
+            return True, ""
+
+        for command in commands:
+            print(f"  [verify] $ {command}")
             try:
-                exceeded, reason, parsed = self.usage_checker.is_limit_exceeded(
-                    threshold=self.usage_threshold
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.verify_timeout,
+                    cwd=cwd,
                 )
-
-                if not exceeded:
-                    return  # Limits are OK, proceed
-
-                # Find which limit is exceeded and when it resets
-                reset_info = None
-                limit_name = None
-                if (
-                    parsed
-                    and "five_hour" in parsed
-                    and parsed["five_hour"]["utilization"] >= self.usage_threshold
-                ):
-                    reset_info = parsed["five_hour"]
-                    limit_name = "5-hour session limit"
-                elif (
-                    parsed
-                    and "seven_day" in parsed
-                    and parsed["seven_day"]["utilization"] >= self.usage_threshold
-                ):
-                    reset_info = parsed["seven_day"]
-                    limit_name = "7-day weekly limit"
-
-                if reset_info:
-                    reset_timestamp = reset_info.get("resets_at")
-                    if reset_timestamp:
-                        try:
-                            reset_dt = datetime.fromisoformat(
-                                reset_timestamp.replace("Z", "+00:00")
-                            )
-                            now = datetime.now(reset_dt.tzinfo)
-                            seconds_until_reset = int((reset_dt - now).total_seconds())
-
-                            if seconds_until_reset <= 0:
-                                return
-
-                            print(f"\n{'=' * 60}")
-                            print(f"⚠ Usage limit exceeded: {reason}")
-                            print(f"{'=' * 60}")
-                            print(f"{limit_name}: {reset_info['utilization_percent']}")
-                            print(f"Resets in:   {reset_info['time_until_reset']}")
-                            print(f"Reset time:  {reset_info['resets_at_local']}")
-                            print(f"\nSleeping until reset ({reset_info['time_until_reset']})...")
-                            print(f"{'=' * 60}\n")
-
-                            time.sleep(seconds_until_reset + 10)
-                            return  # Re-check limits after wake
-                        except Exception as e:
-                            logger.warning(f"Could not parse reset time: {e}")
-                            time.sleep(300)  # Fallback: wait 5 minutes
-                    else:
-                        logger.warning("Limit exceeded but couldn't determine reset time")
-                        time.sleep(300)
-                else:
-                    logger.warning("Limit exceeded but couldn't determine reset time")
-                    time.sleep(60)
-
+            except subprocess.TimeoutExpired:
+                message = f"verify command timed out after {self.verify_timeout}s: {command}"
+                print(f"  [verify] ✗ {message}")
+                return False, message[-2000:]
             except Exception as e:
-                logger.error(f"Error checking usage limits: {e}")
-                return
+                message = f"verify command failed to start: {command} ({e})"
+                print(f"  [verify] ✗ {message}")
+                return False, message[-2000:]
+
+            if result.returncode != 0:
+                combined = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+                tail = combined[-2000:]
+                print(f"  [verify] ✗ exit {result.returncode}: {tail[:200]}")
+                return False, tail
+
+            print("  [verify] ✓ passed")
+
+        return True, ""
+
+    # --- Git guard -------------------------------------------------------
+
+    @staticmethod
+    def _find_git_root(start: Path | None) -> Path | None:
+        """Locate the enclosing git work tree by looking for a `.git` entry.
+
+        Filesystem-only (no subprocess) so it is a cheap no-op outside a repo.
+        """
+        if start is None:
+            return None
+        current = start if start.is_dir() else start.parent
+        for candidate in [current, *current.parents]:
+            if (candidate / ".git").exists():
+                return candidate
+        return None
+
+    def _git(self, repo: Path, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, timeout=120)
+
+    def git_commit(self, task: Task, cwd: Path | None) -> None:
+        """Archive a verified task: `git add .` then a tagged commit."""
+        repo = self._find_git_root(cwd)
+        if repo is None:
+            logger.debug("No git repository detected; skipping auto-commit")
+            return
+        try:
+            self._git(repo, "add", ".")
+            commit = self._git(repo, "commit", "-m", f"AutoTask: [{task.id}] 完成")
+            if commit.returncode == 0:
+                head = self._git(repo, "rev-parse", "--short", "HEAD")
+                if head.returncode == 0:
+                    commit_hash = head.stdout.strip()
+                    self.queue.update_task(task.id, commit_hash=commit_hash)
+                    print(f"  [git] ✓ committed 'AutoTask: [{task.id}] 完成' ({commit_hash})")
+                else:
+                    print(f"  [git] ✓ committed 'AutoTask: [{task.id}] 完成'")
+            else:
+                detail = (commit.stdout or "") + (commit.stderr or "")
+                print(f"  [git] commit skipped: {detail.strip()[:200]}")
+        except Exception as e:
+            logger.warning(f"Git auto-commit failed: {e}")
+
+    def git_rollback(self, task: Task, cwd: Path | None) -> None:
+        """Circuit-breaker: discard dirty changes left behind by a failed task."""
+        repo = self._find_git_root(cwd)
+        if repo is None:
+            logger.debug("No git repository detected; skipping rollback")
+            return
+        try:
+            self._git(repo, "reset", "--hard")
+            self._git(repo, "clean", "-fd")
+            print(f"  [git] ⟲ rolled back workspace for {task.id}")
+        except Exception as e:
+            logger.warning(f"Git rollback failed: {e}")
+
+    def write_stuck(self, task: Task, cwd: Path | None, log: str) -> None:
+        """Append a skipped-task report to STUCK.md inside the workspace."""
+        base = cwd or Path.cwd()
+        stuck_file = base / "STUCK.md"
+        entry = (
+            f"\n## {task.id} — {datetime.now().isoformat()}\n\n"
+            f"- Status: SKIPPED (on_fail: skip)\n"
+            f"- Session: {task.session_name}\n"
+            f"- Attempts: {task.attempts}/{task.max_attempts}\n"
+            f"- Engine (last): {task.engine or 'n/a'}\n"
+            f"- Prompt: {task.prompt[:500]}\n\n"
+            f"```\n{log.strip()}\n```\n"
+        )
+        try:
+            with open(stuck_file, "a", encoding="utf-8") as f:
+                f.write(entry)
+            print(f"  [stuck] failure report appended to {stuck_file}")
+        except Exception as e:
+            logger.warning(f"Failed to write STUCK.md: {e}")
+
+    # --- Failure handling ------------------------------------------------
+
+    def _handle_failure(
+        self,
+        task: Task,
+        attempt: int,
+        cwd: Path | None,
+        error: str,
+        feedback: str = "",
+    ) -> bool:
+        """Central failure path: schedule a retry, or finish the task.
+
+        While retries remain the task is re-queued and any verifier feedback is
+        persisted so the next attempt (which runs on the fallback engine)
+        receives the failure tail in its prompt. Once retries are exhausted the
+        task follows `on_fail`:
+          - "skip": git rollback circuit-breaker + STUCK.md + SKIPPED
+          - "fail": mark FAILED (default)
+        """
+        error = (error or "").strip()
+        exhausted = attempt >= task.max_attempts
+
+        if not exhausted:
+            print(
+                f"↻ Task {task.id} re-queued for retry "
+                f"({attempt}/{task.max_attempts}): {error[:200]}"
+            )
+            updates: dict = {
+                "status": TaskStatus.QUEUED.value,
+                "last_error": error[:500],
+            }
+            if feedback:
+                existing = (task.feedback or "").strip()
+                updates["feedback"] = f"{existing}\n\n{feedback}".strip() if existing else feedback
+            self.queue.update_task(task.id, **updates)
+            return False
+
+        if (task.on_fail or "fail").lower() == "skip":
+            print(f"⊘ Task {task.id} exhausted retries -> rollback + SKIPPED")
+            if self.enable_git_guard:
+                self.git_rollback(task, cwd)
+            self.write_stuck(task, cwd, error)
+            self.queue.update_task(
+                task.id,
+                status=TaskStatus.SKIPPED.value,
+                last_error=error[:500],
+            )
+        else:
+            print(f"✗ Task {task.id} failed: {error[:200]}")
+            self.queue.update_task(task.id, status=TaskStatus.FAILED.value, last_error=error[:500])
+        return False
 
     def execute_task(self, task: Task) -> bool:
-        """Execute a single task. Returns True if successful."""
+        """Execute a single task. Returns True only if verified successful.
+
+        Lifecycle:
+          1. Pick the engine for this attempt (attempt 1 -> agy, >=2 -> codex).
+          2. Run the CLI in the task workspace.
+          3. On CLI success, run `verify_commands` (external hard verifier).
+          4. All verifiers pass -> git auto-commit + COMPLETED.
+          5. Otherwise feed the failure tail back into the prompt and retry;
+             on exhaustion honour `on_fail` (skip -> rollback + STUCK.md).
+        """
+        attempt = task.attempts + 1
 
         print(f"\n{'=' * 60}")
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Executing task: {task.id}")
         print(f"Session: {task.session_name}")
         if task.working_dir:
             print(f"Working dir: {task.working_dir}")
-        print(f"Attempt: {task.attempts + 1}/{task.max_attempts}")
-        print(
-            f"Prompt: {task.prompt[:100]}..."
-            if len(task.prompt) > 100
-            else f"Prompt: {task.prompt}"
+        print(f"Attempt: {attempt}/{task.max_attempts}")
+
+        effective_prompt = self._effective_prompt(task)
+        engine = select_engine(attempt, self.primary_engine, self.fallback_engine)
+        binary = resolve_engine_binary(engine)
+
+        if binary is None:
+            alternative = (
+                self.fallback_engine if engine == self.primary_engine else self.primary_engine
+            )
+            alt_binary = resolve_engine_binary(alternative)
+            if alt_binary is not None:
+                print(f"⚠ Engine '{engine}' not found on PATH; using '{alternative}' instead")
+                engine, binary = alternative, alt_binary
+            else:
+                print(
+                    f"⚠ Engine '{engine}' not found on PATH and no fallback available; "
+                    f"attempting to run it anyway"
+                )
+                binary = ENGINE_BINARIES.get(engine, engine)
+
+        print(f"Engine: {engine} ({binary})")
+        preview = (
+            effective_prompt[:100] + "..." if len(effective_prompt) > 100 else effective_prompt
         )
+        print(f"Prompt: {preview}")
         print(f"{'=' * 60}\n")
 
         # Update task status
@@ -887,21 +977,20 @@ class ClaudeWorker:
             task.id,
             status=TaskStatus.RUNNING.value,
             started_at=datetime.now().isoformat(),
-            attempts=task.attempts + 1,
+            attempts=attempt,
+            engine=engine,
         )
 
+        cwd = None
+        if task.working_dir:
+            cwd = Path(task.working_dir).expanduser().resolve()
+            logger.info(f"Executing in directory: {cwd}")
+
+        cmd = build_engine_command(engine, effective_prompt, binary)
+        effective_timeout = task.timeout if task.timeout is not None else self.task_timeout
+
         try:
-            # Build Claude command
-            cmd = ["claude", "-p", task.prompt]
-
-            # Determine working directory
-            cwd = None
-            if task.working_dir:
-                cwd = Path(task.working_dir).expanduser().resolve()
-                logger.info(f"Executing in directory: {cwd}")
-
-            # Execute Claude
-            effective_timeout = task.timeout if task.timeout is not None else self.task_timeout
+            # Execute the selected CLI engine.
             if self.stream_output:
                 # Stream stdout to terminal; capture stderr for rate-limit detection
                 result = subprocess.run(
@@ -918,79 +1007,80 @@ class ClaudeWorker:
                     cmd, capture_output=True, text=True, timeout=effective_timeout, cwd=cwd
                 )
                 stdout_out, stderr_out = result.stdout, result.stderr
-
-            if result.returncode == 0:
-                print(f"✓ Task {task.id} completed successfully")
-
-                # Save output if requested
-                if self.save_output:
-                    output_file = self.output_dir / f"{task.id}.txt"
-                    try:
-                        with open(output_file, "w") as f:
-                            f.write(f"Task: {task.id}\n")
-                            f.write(f"Session: {task.session_name}\n")
-                            f.write(f"Completed: {datetime.now().isoformat()}\n")
-                            f.write("=" * 60 + "\n")
-                            f.write(stdout_out)
-                        print(f"  Output saved to: {output_file}")
-                    except Exception as e:
-                        logger.warning(f"Failed to save output: {e}")
-
-                self.queue.update_task(
-                    task.id,
-                    status=TaskStatus.COMPLETED.value,
-                    completed_at=datetime.now().isoformat(),
-                )
-                return True
-            else:
-                # Check if rate limited
-                if "rate limit" in stderr_out.lower() or "rate_limit" in stderr_out.lower():
-                    print(f"⏸ Task {task.id} hit rate limit")
-
-                    # Parse rate limit information from error
-                    rate_limit_info = self.parse_rate_limit_info(stderr_out)
-
-                    self.queue.update_task(
-                        task.id,
-                        status=TaskStatus.RATE_LIMITED.value,
-                        last_error=rate_limit_info["error_message"],
-                    )
-                    return False
-                else:
-                    print(f"✗ Task {task.id} failed: {stderr_out[:200]}")
-
-                    # Check if max attempts reached
-                    if task.attempts + 1 >= task.max_attempts:
-                        self.queue.update_task(
-                            task.id, status=TaskStatus.FAILED.value, last_error=stderr_out[:500]
-                        )
-                    else:
-                        self.queue.update_task(
-                            task.id, status=TaskStatus.QUEUED.value, last_error=stderr_out[:500]
-                        )
-                    return False
-
         except subprocess.TimeoutExpired:
             print(f"⏱ Task {task.id} timed out")
-            self.queue.update_task(
-                task.id, status=TaskStatus.QUEUED.value, last_error="Execution timeout"
-            )
-            return False
-
+            return self._handle_failure(task, attempt, cwd, "Execution timeout")
         except Exception as e:
-            print(f"✗ Task {task.id} error: {str(e)}")
-            self.queue.update_task(
-                task.id,
-                status=TaskStatus.FAILED.value
-                if task.attempts + 1 >= task.max_attempts
-                else TaskStatus.QUEUED.value,
-                last_error=str(e),
+            print(f"✗ Task {task.id} error: {e}")
+            return self._handle_failure(task, attempt, cwd, f"Execution error: {e}")
+
+        if result.returncode != 0:
+            # Check if rate limited
+            if "rate limit" in stderr_out.lower() or "rate_limit" in stderr_out.lower():
+                print(f"⏸ Task {task.id} hit rate limit")
+                rate_limit_info = self.parse_rate_limit_info(stderr_out)
+                self.queue.update_task(
+                    task.id,
+                    status=TaskStatus.RATE_LIMITED.value,
+                    last_error=rate_limit_info["error_message"],
+                )
+                return False
+
+            return self._handle_failure(
+                task,
+                attempt,
+                cwd,
+                stderr_out or f"CLI exited with code {result.returncode}",
             )
-            return False
+
+        # --- External hard verifier -------------------------------------
+        verified, verify_log = self.run_verify_commands(task, cwd)
+        if not verified:
+            print(f"✗ Task {task.id} failed verification")
+            feedback = "上次修改未通过验收，报错如下，请修复：\n" + verify_log
+            return self._handle_failure(
+                task,
+                attempt,
+                cwd,
+                f"Verification failed:\n{verify_log}",
+                feedback=feedback,
+            )
+
+        # --- Success: archive with git, then mark completed ---------------
+        print(f"✓ Task {task.id} completed successfully")
+
+        if self.enable_git_guard:
+            self.git_commit(task, cwd)
+
+        # Save output if requested
+        if self.save_output:
+            output_file = self.output_dir / f"{task.id}.txt"
+            try:
+                with open(output_file, "w", encoding="utf-8") as f:
+                    f.write(f"Task: {task.id}\n")
+                    f.write(f"Session: {task.session_name}\n")
+                    f.write(f"Engine: {engine}\n")
+                    f.write(f"Completed: {datetime.now().isoformat()}\n")
+                    f.write("=" * 60 + "\n")
+                    f.write(stdout_out)
+                print(f"  Output saved to: {output_file}")
+            except Exception as e:
+                logger.warning(f"Failed to save output: {e}")
+
+        self.queue.update_task(
+            task.id,
+            status=TaskStatus.COMPLETED.value,
+            completed_at=datetime.now().isoformat(),
+            feedback="",
+        )
+        return True
 
     def run(self):
         """Main worker loop"""
-        print("Claude Code Task Worker Started")
+        self.started_at = datetime.now()
+        print("Task Queue Worker Started")
+        print(f"Engines: primary={self.primary_engine} fallback={self.fallback_engine}")
+        print(f"Started at: {self.started_at.strftime('%Y-%m-%d %H:%M:%S')}")
         print("Press Ctrl+C to stop\n")
 
         # Reset tasks stuck in RUNNING from a previously interrupted worker
@@ -1002,11 +1092,9 @@ class ClaudeWorker:
             for t in running_tasks:
                 self.queue.update_task(t.id, status=TaskStatus.QUEUED.value)
 
+        exit_reason = "queue drained"
         try:
             while self.running:
-                # Limits checked here on every iteration, including before the very first task
-                self.check_and_wait_for_limits()
-
                 task = self.queue.get_next_task()
 
                 if task is None:
@@ -1031,7 +1119,13 @@ class ClaudeWorker:
                             updated_task = t
                             break
 
-                    if updated_task and updated_task.status == TaskStatus.RATE_LIMITED.value:
+                    if updated_task and updated_task.status == TaskStatus.SKIPPED.value:
+                        # Rolled back and parked; keep draining the rest of the queue
+                        print(
+                            f"\n⊘ Task {updated_task.id} skipped; continuing with the rest of the queue\n"
+                        )
+                        time.sleep(1)
+                    elif updated_task and updated_task.status == TaskStatus.RATE_LIMITED.value:
                         # Parse rate limit info from last error
                         rate_limit_info = self.parse_rate_limit_info(updated_task.last_error or "")
                         delay = self.calculate_wait_time(rate_limit_info, updated_task)
@@ -1062,6 +1156,10 @@ class ClaudeWorker:
         except KeyboardInterrupt:
             print("\n\n⚠ Worker stopped by user")
             self.running = False
+            exit_reason = "terminated by user (Ctrl+C)"
+        finally:
+            # Always leave a run summary behind, on normal drain or termination.
+            self.write_morning_report(reason=exit_reason)
 
 
 def cmd_add(args, queue: TaskQueue):
@@ -1073,12 +1171,17 @@ def cmd_add(args, queue: TaskQueue):
         priority=args.priority,
         working_dir=getattr(args, "working_dir", None),
         timeout=getattr(args, "timeout", None),
+        verify_commands=getattr(args, "verify_command", None) or None,
+        on_fail=getattr(args, "on_fail", "fail"),
     )
     print(f"✓ Task added: {task.id}")
     print(f"  Session: {task.session_name}")
     print(f"  Priority: {task.priority}")
     if task.working_dir:
         print(f"  Working dir: {task.working_dir}")
+    if task.verify_commands:
+        print(f"  Verify: {', '.join(task.verify_commands)}")
+    print(f"  On fail: {task.on_fail}")
     print(
         f"  Prompt: {task.prompt[:80]}..." if len(task.prompt) > 80 else f"  Prompt: {task.prompt}"
     )
@@ -1086,23 +1189,19 @@ def cmd_add(args, queue: TaskQueue):
 
 def cmd_worker(args, queue: TaskQueue):
     """Start worker process"""
-    # Usage limit checking is mandatory
-    try:
-        usage_checker = ClaudeUsageChecker(session_key=args.session_key, api_url=args.api_url)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
     worker = ClaudeWorker(
         queue,
         base_retry_delay=args.retry_delay,
-        usage_checker=usage_checker,
         save_output=args.save_output,
         stream_output=args.stream,
-        usage_threshold=args.threshold,
         idle=args.idle is not None,
         idle_interval=args.idle if args.idle is not None else 30,
         task_timeout=args.timeout,
+        primary_engine=args.primary_engine,
+        fallback_engine=args.fallback_engine,
+        verify_timeout=args.verify_timeout,
+        enable_git_guard=not args.no_git_guard,
+        report_file=Path(args.report_file) if args.report_file else None,
     )
     worker.run()
 
@@ -1111,7 +1210,7 @@ def cmd_status(args, queue: TaskQueue):
     """Show queue status"""
     stats = queue.get_stats()
 
-    print("\nClaude Task Queue Status")
+    print("\nTask Queue Status")
     print("=" * 40)
     print(f"Total tasks:      {stats['total']}")
     print(f"Queued:           {stats['queued']}")
@@ -1119,6 +1218,7 @@ def cmd_status(args, queue: TaskQueue):
     print(f"Completed:        {stats['completed']}")
     print(f"Failed:           {stats['failed']}")
     print(f"Rate Limited:     {stats['rate_limited']}")
+    print(f"Skipped:          {stats['skipped']}")
     print("=" * 40)
 
     # Show next task
@@ -1154,6 +1254,7 @@ def cmd_list(args, queue: TaskQueue):
             TaskStatus.COMPLETED.value: "✓",
             TaskStatus.FAILED.value: "✗",
             TaskStatus.RATE_LIMITED.value: "⏸",
+            TaskStatus.SKIPPED.value: "⊘",
         }.get(task.status, "?")
 
         print(f"{status_icon} {task.id}")
@@ -1163,6 +1264,12 @@ def cmd_list(args, queue: TaskQueue):
         print(f"   Session: {task.session_name}")
         if task.working_dir:
             print(f"   Working dir: {task.working_dir}")
+        if task.verify_commands:
+            print(f"   Verify: {', '.join(task.verify_commands)}")
+        if task.on_fail != "fail":
+            print(f"   On fail: {task.on_fail}")
+        if task.engine:
+            print(f"   Engine (last): {task.engine}")
         print(f"   Created: {task.created_at}")
 
         prompt_preview = task.prompt[:100] + "..." if len(task.prompt) > 100 else task.prompt
@@ -1244,21 +1351,18 @@ def load_batch_file(file_path: Path) -> list[dict]:
             raise ValidationError(f"Task {i}: must be a dictionary")
         if "prompt" not in task:
             raise ValidationError(f"Task {i}: missing required field 'prompt'")
+        verify_commands = task.get("verify_commands")
+        if verify_commands is not None:
+            if not isinstance(verify_commands, list) or not all(
+                isinstance(c, str) and c.strip() for c in verify_commands
+            ):
+                raise ValidationError(
+                    f"Task {i}: 'verify_commands' must be a list of non-empty strings"
+                )
+        if "on_fail" in task and task["on_fail"] not in ("fail", "skip"):
+            raise ValidationError(f"Task {i}: 'on_fail' must be 'fail' or 'skip'")
 
     return tasks
-
-
-def cmd_usage(args):
-    """Check Claude usage limits"""
-    try:
-        checker = ClaudeUsageChecker(session_key=args.session_key, api_url=args.api_url)
-        checker.check_usage(json_output=args.json)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-    except requests.RequestException as e:
-        print(f"API Error: {e}", file=sys.stderr)
-        sys.exit(1)
 
 
 def cmd_batch(args, queue: TaskQueue):
@@ -1277,13 +1381,17 @@ def cmd_batch(args, queue: TaskQueue):
             priority = task_data.get("priority", 0)
             max_attempts = task_data.get("max_attempts", 3)
             depends_on = task_data.get("depends_on", [])
+            verify_commands = task_data.get("verify_commands", [])
+            on_fail = task_data.get("on_fail", "fail")
             prompt = task_data["prompt"]
             prompt_preview = prompt[:80] + "..." if len(prompt) > 80 else prompt
 
             print(f"{i}. Session: {session}")
-            print(f"   Priority: {priority} | Max attempts: {max_attempts}")
+            print(f"   Priority: {priority} | Max attempts: {max_attempts} | On fail: {on_fail}")
             if depends_on:
                 print(f"   Depends on: {', '.join(depends_on)}")
+            if verify_commands:
+                print(f"   Verify: {', '.join(verify_commands)}")
             print(f"   Prompt: {prompt_preview}")
             print()
         return
@@ -1339,6 +1447,8 @@ def cmd_batch(args, queue: TaskQueue):
                     depends_on=depends_on_ids if depends_on_ids else None,
                     working_dir=task_data.get("working_dir"),
                     timeout=task_data.get("timeout"),
+                    verify_commands=task_data.get("verify_commands") or None,
+                    on_fail=task_data.get("on_fail", "fail"),
                 )
                 session_display = task.session_name or "auto-generated"
 
@@ -1393,7 +1503,10 @@ def cmd_batch(args, queue: TaskQueue):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claude Code Task Queue Manager\n\nFor examples and documentation, see README.md",
+        description=(
+            "Task Queue Manager (dual-engine: agy / gemini / codex)\n\n"
+            "For examples and documentation, see README_CN.md"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
     )
@@ -1428,32 +1541,61 @@ def main():
         default=None,
         help="Task execution timeout in seconds, overrides global --timeout (default: 3600)",
     )
+    add_parser.add_argument(
+        "--verify-command",
+        action="append",
+        default=None,
+        metavar="CMD",
+        help="Verification command that must exit 0 (repeatable, e.g. --verify-command 'pytest')",
+    )
+    add_parser.add_argument(
+        "--on-fail",
+        choices=["fail", "skip"],
+        default="fail",
+        help="Policy when retries are exhausted: 'fail' or 'skip' (rollback + STUCK.md)",
+    )
 
     # Worker command
-    worker_parser = subparsers.add_parser(
-        "worker", help="Start task worker (requires CLAUDE_SESSION_KEY env var)"
-    )
+    worker_parser = subparsers.add_parser("worker", help="Start task worker")
     worker_parser.add_argument(
         "--retry-delay", type=int, default=60, help="Base retry delay in seconds (default: 60)"
     )
     worker_parser.add_argument(
-        "--session-key",
-        help="Claude session cookie for usage checking (or use CLAUDE_SESSION_KEY env var)",
+        "--primary-engine",
+        default=DEFAULT_PRIMARY_ENGINE,
+        choices=sorted(ENGINE_BINARIES),
+        help=f"Engine used on the first attempt (default: {DEFAULT_PRIMARY_ENGINE})",
     )
-    worker_parser.add_argument("--api-url", help="Override API endpoint URL for usage checking")
+    worker_parser.add_argument(
+        "--fallback-engine",
+        default=DEFAULT_FALLBACK_ENGINE,
+        choices=sorted(ENGINE_BINARIES),
+        help=f"Engine used on retries (default: {DEFAULT_FALLBACK_ENGINE})",
+    )
+    worker_parser.add_argument(
+        "--verify-timeout",
+        type=int,
+        default=600,
+        help="Timeout per verify command in seconds (default: 600)",
+    )
+    worker_parser.add_argument(
+        "--no-git-guard",
+        action="store_true",
+        help="Disable git auto-commit on success and git rollback on skip",
+    )
     worker_parser.add_argument(
         "--save-output", action="store_true", help="Save task outputs to ~/.claude-queue/outputs/"
     )
     worker_parser.add_argument(
         "--stream",
         action="store_true",
-        help="Stream Claude output to terminal in real-time (disables output saving)",
+        help="Stream engine output to terminal in real-time (disables output saving)",
     )
     worker_parser.add_argument(
-        "--threshold",
-        type=float,
-        default=95.0,
-        help="Usage percentage at which worker pauses (default: 95.0)",
+        "--report-file",
+        default=None,
+        metavar="PATH",
+        help="Path for MORNING_REPORT.md (default: ./MORNING_REPORT.md)",
     )
     worker_parser.add_argument(
         "--timeout",
@@ -1498,14 +1640,6 @@ def main():
         "--dry-run", action="store_true", help="Show tasks without adding them"
     )
 
-    # Usage command
-    usage_parser = subparsers.add_parser("usage", help="Check Claude usage limits")
-    usage_parser.add_argument(
-        "--session-key", help="Claude session cookie (or use CLAUDE_SESSION_KEY env var)"
-    )
-    usage_parser.add_argument("--json", action="store_true", help="Output as JSON")
-    usage_parser.add_argument("--api-url", help="Override API endpoint URL")
-
     args = parser.parse_args()
 
     # Show help if no command provided
@@ -1515,8 +1649,8 @@ def main():
 
     output_dir = Path.home() / ".claude-queue" / "outputs"
 
-    # Initialize queue (not needed for usage/output commands)
-    queue = TaskQueue(args.queue_file) if args.command not in ("usage", "output") else None
+    # Initialize queue (not needed for the output command)
+    queue = TaskQueue(args.queue_file) if args.command != "output" else None
 
     # Execute command
     if args.command == "add":
@@ -1535,16 +1669,11 @@ def main():
         cmd_output(args, output_dir)
     elif args.command == "batch":
         cmd_batch(args, queue)
-    elif args.command == "usage":
-        cmd_usage(args)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except SessionExpiredError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
     except ValidationError as e:
         logger.error(f"Validation error: {e}")
         print(f"Error: {e}", file=sys.stderr)
