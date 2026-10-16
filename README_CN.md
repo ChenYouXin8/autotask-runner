@@ -14,7 +14,7 @@
 | 维度 | 原始项目 | 改造后 |
 | --- | --- | --- |
 | 执行器 | 硬编码 `claude -p <prompt>` | 多引擎可配置：`agy` / `gemini` / `codex` |
-| 默认引擎 | — | 主/备均为 `codex`（本机 `agy`、`gemini` 不在 PATH，避免白耗 attempt 1） |
+| 默认引擎 | — | 主/备均为 `codex`；`gemini`/`agy` 作为显式 opt-in（见第二节） |
 | 失败处理 | 同引擎重试 | **第 2 次起自动切换到备用引擎**（故障轮替） |
 | 成功判定 | 仅看 CLI 退出码 | CLI 退出码 **+** `verify_commands` 全部返回 0 |
 | 验收失败 | 无 | 捕获报错尾部拼进下一轮 prompt，让 AI 自我修复 |
@@ -60,17 +60,40 @@ $env:AGY_BIN = "C:\path\to\agy.exe"      # 指向真实的 agy 可执行文件/�
 setx AGY_BIN "C:\path\to\agy.exe"        # 永久生效
 ```
 
+> ⚠ **实测结论**：Antigravity 桌面版本机**不提供** `agy` 独立命令行，只装了
+> `Antigravity.exe`（GUI）与 `resources\bin\language_server.exe`。配套的
+> `~/.gemini/antigravity/bin/agentapi.bat` 是**连接运行中 language server 的 RPC 客户端**
+> （子命令仅 `new-conversation` / `send-message` / `get-conversation-metadata`），
+> 必须设置 `ANTIGRAVITY_LS_ADDRESS` 且保持 Antigravity 应用常驻；它是**异步**语义
+> （发出即返回 conversation_id，无阻塞、无退出码、无工作目录参数），**不适合无人值守**。
+> 因此 `agy` 仅在你确实拥有一个「阻塞式、带退出码」的 agy 式 CLI 时，才通过 `AGY_BIN` 启用。
+
 ### 3. 可选：配置 Google Gemini CLI（`gemini`）
 
-命令格式（`--yolo` 等价于 agy 的跳过权限确认）：
+非交互命令格式（`--yolo` 自动批准全部操作；`--skip-trust` 会话内信任当前工作区）：
 
 ```text
-gemini -p "<prompt>" --yolo
+gemini -p "<prompt>" --yolo --skip-trust
 ```
 
+> ⚠ **`--skip-trust` 不可省略**：gemini 在「未信任目录」里会把 `--yolo` **强制降级回
+> `default` 审批模式**（实测报 `Approval mode overridden to "default" because the current
+> folder is not trusted`），无人值守时会在第一个工具调用处卡死。
+
+> ⚠ **不要使用「Log in with Google」OAuth 登录**。实测 Google 已下线 gemini-cli 的个人
+> OAuth 层，调用会直接抛 `IneligibleTierError / UNSUPPORTED_CLIENT`（并提示迁移到
+> Antigravity），重新登录或换账号都无法绕过。当前唯一能跑通的路径是 **API Key**：
+
 ```powershell
-setx GEMINI_BIN "C:\path\to\gemini.cmd"  # 若不在 PATH，可显式指定
+# 1) 在 https://aistudio.google.com/apikey 生成 API Key
+setx GEMINI_API_KEY "your-key"           # 持久化，无人值守进程可继承
+setx GEMINI_BIN "C:\path\to\gemini.cmd"  # 可选：不在 PATH 时显式指定
 ```
+
+> 注：`npm install -g @google/gemini-cli` 在 Windows 生成的入口是 `gemini.cmd`；
+> `resolve_engine_binary("gemini")` 通过 `shutil.which` 返回**完整路径**
+> （如 `C:\nodejs\gemini.CMD`），因此 `subprocess.run` 可直接执行；
+> 若传裸名 `"gemini"` 反而会 `FileNotFoundError`（CreateProcess 不会解析 `.cmd`）。
 
 ### 4. 引擎解析顺序
 
@@ -87,12 +110,13 @@ setx GEMINI_BIN "C:\path\to\gemini.cmd"  # 若不在 PATH，可显式指定
 - **第 1 次尝试**：`--primary-engine`（默认 `codex`）
 - **第 2 次及以后**：`--fallback-engine`（默认 `codex`）
 
-本机既无 `agy` 也无 `gemini`，因此默认两者都是 `codex`，避免第 1 次尝试白白消耗。
-若你已装好 `agy`/`gemini`，可显式启用轮替：
+本机 `gemini` 虽已安装但 OAuth 层被 Google 下线（需 `GEMINI_API_KEY`），`agy` 又不提供独立
+CLI，因此**默认主/备都是 `codex`**，避免把重试烧死在必然报错的引擎上。若你已把第二引擎
+配好，可显式启用轮替：
 
 ```powershell
---primary-engine agy --fallback-engine codex
---primary-engine gemini --fallback-engine codex
+--primary-engine codex --fallback-engine gemini   # 需先配置 GEMINI_API_KEY
+--primary-engine codex --fallback-engine agy      # 需 AGY_BIN 指向真实 agy CLI
 ```
 
 ---
@@ -239,19 +263,19 @@ python claude-queue.py add "修复登录接口的空指针异常" `
 ### 1. 端到端自测（临时目录，非交付目录）
 
 ```text
-%TEMP%\cq_selftest2\verify_report.py
+%TEMP%\cq_engine_test\run_test.py
 ```
 
-覆盖三条关键链路 + 早报与默认引擎：
+用**桩引擎**（`CODEX_BIN` / `GEMINI_BIN` 指向脚本）验证双引擎轮替路由与早报，不依赖真实模型：
 
 | 场景 | 期望结果 |
 | --- | --- |
-| 默认引擎 | `primary=fallback=codex`，`gemini` 构造器可用 |
-| A. 验收通过 | `completed`，`attempts=1`，`engine=codex`，报含 commit hash |
-| B. 连续验收失败 | `skipped`，脏代码回滚，`STUCK.md` 生成，报含失败摘要 |
+| A. attempt 1 失败 → attempt 2 轮替 | `codex` 失败后自动切到 `gemini`，`attempts=2`、`engine=gemini` |
+| B. 验收 + 真实落盘 | 回退引擎在 workspace 真实写入文件并通过 `verify_commands` |
+| C. 睡醒早报 | 报告列出实际使用的引擎与尝试次数 |
 
 ```text
-15/15 checks passed
+8/8 checks passed
 ```
 
 ### 2. 上游单元测试

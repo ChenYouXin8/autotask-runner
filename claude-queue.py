@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Task Queue Manager — dual-engine fork (Antigravity `agy` + OpenAI `codex`)
+Task Queue Manager — multi-engine fork (OpenAI `codex` + opt-in failover engines)
 
 Handles batch execution of AI coding tasks with:
-  * two interchangeable CLI engines with automatic failover
-    (attempt 1 -> `agy`, retries -> `codex`),
+  * interchangeable CLI engines with automatic failover
+    (attempt 1 -> `codex`, retries -> `--fallback-engine`),
   * an external hard verifier (`verify_commands`) that must exit 0,
   * a git guard that auto-commits verified work and rolls back skipped tasks.
 
@@ -125,14 +125,16 @@ def _release_lock(file_obj) -> None:
 # CLI engine abstraction
 #
 # The original project hard-coded the `claude` CLI. This fork decouples the
-# executor into interchangeable engines with automatic failover:
-#   "agy"    -> Antigravity CLI    (attempt 1 when installed)
-#   "gemini" -> Google Gemini CLI  (attempt 1 when installed)
-#   "codex"  -> OpenAI Codex CLI   (retry / default everywhere)
+# executor into interchangeable engines:
+#   "codex"  -> OpenAI Codex CLI       (default, works unattended)
+#   "gemini" -> Google Gemini CLI      (opt-in; requires GEMINI_API_KEY)
+#   "agy"    -> Antigravity agentapi   (opt-in; requires a live LS address)
 #
-# Defaults are both "codex": `agy` and `gemini` are not registered on PATH on
-# every machine, and silently burning attempt 1 on a missing binary would waste
-# a retry. Opt in with --primary-engine agy (or gemini) when available.
+# Defaults are codex -> codex. Neither alternative engine works out of the box
+# on this machine (Google retired the Gemini CLI OAuth tier, and Antigravity
+# ships no standalone CLI), so enabling them is an explicit choice via
+# --primary-engine / --fallback-engine. If a selected engine cannot be resolved,
+# execute_task switches to the other one instead of wasting the attempt.
 # ---------------------------------------------------------------------------
 
 
@@ -164,16 +166,19 @@ def build_engine_command(engine: str, prompt: str, binary: str) -> list[str]:
     """Build the argv for a given engine.
 
     - agy:    [agy, -p, {prompt}, --dangerously-skip-permissions]
-    - gemini: [gemini, -p, {prompt}, --yolo]
+    - gemini: [gemini, -p, {prompt}, --yolo, --skip-trust]
     - codex:  [codex, exec, --ask-for-approval, never, --sandbox,
                workspace-write, {prompt}]
     """
     if engine == "agy":
         return [binary, "-p", prompt, "--dangerously-skip-permissions"]
     if engine == "gemini":
-        # `--yolo` = non-interactive auto-approve, the Gemini CLI equivalent of
-        # agy's --dangerously-skip-permissions.
-        return [binary, "-p", prompt, "--yolo"]
+        # `--yolo` auto-approves every action (the Gemini CLI equivalent of agy's
+        # --dangerously-skip-permissions). `--skip-trust` trusts the workspace for
+        # this session; without it the CLI downgrades approval mode back to
+        # "default" in any folder absent from trustedFolders.json, which would make
+        # an unattended run stall on the first tool approval prompt.
+        return [binary, "-p", prompt, "--yolo", "--skip-trust"]
     if engine == "codex":
         return [
             binary,
@@ -214,8 +219,8 @@ def resolve_engine_binary(engine: str) -> str | None:
 def select_engine(attempt: int, primary: str, fallback: str) -> str:
     """Return the engine to use for a 1-based attempt number.
 
-    Attempt 1 uses the primary engine (agy); attempt 2+ switches to the
-    fallback engine (codex), giving a retry a genuinely different executor.
+    Attempt 1 uses the primary engine; attempt 2+ switches to the fallback
+    engine, giving a retry a genuinely different executor.
     """
     return primary if attempt <= 1 else fallback
 
@@ -930,7 +935,7 @@ class ClaudeWorker:
         """Execute a single task. Returns True only if verified successful.
 
         Lifecycle:
-          1. Pick the engine for this attempt (attempt 1 -> agy, >=2 -> codex).
+          1. Pick the engine for this attempt (attempt 1 -> primary, >=2 -> fallback).
           2. Run the CLI in the task workspace.
           3. On CLI success, run `verify_commands` (external hard verifier).
           4. All verifiers pass -> git auto-commit + COMPLETED.
